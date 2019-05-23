@@ -1,68 +1,58 @@
-sample(h::Hamiltonian, prop::AbstractProposal, θ::AbstractVector{T}, n_samples::Int; verbose::Bool=true) where {T<:Real} =
-    sample(GLOBAL_RNG, h, prop, θ, n_samples; verbose=verbose)
+##
+## Sampling functions
+##
 
-function sample(rng::AbstractRNG, h::Hamiltonian, prop::AbstractProposal, θ::AbstractVector{T}, n_samples::Int; verbose::Bool=true) where {T<:Real}
-    θs = Vector{Vector{T}}(undef, n_samples)
-    Hs = Vector{T}(undef, n_samples)
-    αs = Vector{T}(undef, n_samples)
-    time = @elapsed for i = 1:n_samples
-        θs[i], Hs[i], αs[i] = step(rng, h, prop, i == 1 ? θ : θs[i-1])
-    end
-    verbose && @info "Finished sampling with $time (s)" typeof(h.metric) typeof(prop) EBFMI(Hs) mean(αs)
-    return θs
-end
-
-sample(h::Hamiltonian,
-    prop::AbstractProposal,
-    θ::AbstractVector{T},
-    n_samples::Int,
-    adaptor::Adaptation.AbstractAdaptor,
-    n_adapts::Int=min(div(n_samples, 10), 1_000);
-    verbose::Bool=true
-) where {T<:Real} = sample(GLOBAL_RNG, h, prop, θ, n_samples, adaptor, n_adapts; verbose=verbose)
-
-function sample(rng::AbstractRNG,
+sample(
     h::Hamiltonian,
-    prop::AbstractProposal,
+    τ::AbstractProposal,
     θ::AbstractVector{T},
     n_samples::Int,
-    adaptor::Adaptation.AbstractAdaptor,
+    adaptor::Adaptation.AbstractAdaptor=Adaptation.NoAdaptation(),
     n_adapts::Int=min(div(n_samples, 10), 1_000);
-    verbose::Bool=true
+    verbose::Bool=true,
+    progress::Bool=false
+) where {T<:Real} = sample(GLOBAL_RNG, h, τ, θ, n_samples, adaptor, n_adapts; verbose=verbose, progress=progress)
+
+function sample(
+    rng::AbstractRNG,
+    h::Hamiltonian,
+    τ::AbstractProposal,
+    θ::AbstractVector{T},
+    n_samples::Int,
+    adaptor::Adaptation.AbstractAdaptor=Adaptation.NoAdaptation(),
+    n_adapts::Int=min(div(n_samples, 10), 1_000);
+    verbose::Bool=true,
+    progress::Bool=false
 ) where {T<:Real}
+    # Prepare containers to store sampling results
     θs = Vector{Vector{T}}(undef, n_samples)
     Hs = Vector{T}(undef, n_samples)
     αs = Vector{T}(undef, n_samples)
+    # Prepare phase point for sampling
+    r = rand(rng, h.metric)
+    z = phasepoint(h, θ, r)
+    pm = progress ? Progress(n_samples, desc="Sampling", barlen=31) : nothing
     time = @elapsed for i = 1:n_samples
-        θs[i], Hs[i], αs[i] = step(rng, h, prop, i == 1 ? θ : θs[i-1])
-        if i <= n_adapts
-            adapt!(adaptor, θs[i], αs[i])
-            h, prop = update(h, prop, adaptor)
-            if verbose
+        z, αs[i] = transition(rng, τ, h, z)
+        θs[i], Hs[i] = z.θ, neg_energy(z)
+        progress && (showvalues = Tuple[(:iteration, i), (:hamiltonian_energy, Hs[i]), (:acceptance_rate, αs[i])])
+        if !(adaptor isa Adaptation.NoAdaptation)
+            if i <= n_adapts
+                adapt!(adaptor, θs[i], αs[i])
+                h, τ = update(h, τ, adaptor)
+                # Finalize adapation
                 if i == n_adapts
-                    @info "Finished $n_adapts adapation steps" typeof(adaptor) prop.integrator.ϵ h.metric
-                elseif i % Int(n_adapts / 10) == 0
-                    @info "Adapting $i of $n_adapts steps" typeof(adaptor) prop.integrator.ϵ h.metric
+                    finalize!(adaptor)
+                    verbose && @info "Finished $n_adapts adapation steps" typeof(adaptor) τ.integrator.ϵ h.metric
                 end
             end
+            # Progress info for adapation
+            progress && append!(showvalues, [(:step_size, τ.integrator.ϵ), (:precondition, h.metric)])
         end
+        progress && ProgressMeter.next!(pm; showvalues=showvalues)
+        # Refresh momentum for next iteration
+        z = rand_momentum(rng, z, h)
     end
-    verbose && @info "Finished $n_samples sampling steps in $time (s)" typeof(h.metric) typeof(prop) EBFMI(Hs) mean(αs)
+    verbose && @info "Finished $n_samples sampling steps in $time (s)" typeof(h.metric) typeof(τ) EBFMI(Hs) mean(αs)
     return θs
 end
-
-function step(rng::AbstractRNG,
-    h::Hamiltonian,
-    prop::AbstractTrajectory{I},
-    θ::AbstractVector{T}
-) where {T<:Real,I<:AbstractIntegrator}
-    h = update(h, θ) # Ensure h.metric has the same dim as θ.
-    r = rand_momentum(rng, h)
-    θ_new, r_new, α, H_new = transition(rng, prop, h, θ, r)
-    return θ_new, H_new, α
-end
-
-step(h::Hamiltonian,
-    p::AbstractTrajectory,
-    θ::AbstractVector{T}
-) where {T<:Real} = step(GLOBAL_RNG, h, p, θ)
